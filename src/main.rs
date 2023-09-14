@@ -1,17 +1,27 @@
-use std::{collections::HashMap, io};
+use anyhow::Context as _;
+use clap::{Parser, ValueEnum};
+use colored::Colorize as _;
+use std::{collections::HashMap, fmt, process::Output};
 
-use anyhow::Context;
-use clap::Parser;
-use tracing::{debug, info};
+#[derive(ValueEnum, Clone, Copy)]
+enum ShowOutput {
+    OnSuccess,
+    OnFailure,
+    Always,
+    Never,
+}
 
-#[derive(Debug, clap::Parser)]
+#[derive(Parser)]
 struct Args {
-    /// The number of times to run the comand
+    /// The number of times to run the command
     #[arg(short, long, default_value_t = 100)]
     runs: usize,
+    /// When to show the stdout and stderr of each run
+    #[arg(short, long, default_value = "never")]
+    show_output: ShowOutput,
     /// The command to run
-    #[arg(last(true), num_args(1..), required(true))]
-    cmd: Vec<String>,
+    cmd: String,
+    args: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -22,40 +32,53 @@ struct StatusSummary {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .pretty()
-        .with_file(false)
-        .without_time()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
-
-    let mut args = Args::parse();
-    debug!(?args);
-
-    let head = args.cmd.remove(0);
-    let tail = args.cmd;
-
-    info!("running `{head}` with args {tail:?}");
+    let Args {
+        runs,
+        show_output,
+        cmd,
+        args,
+    } = Args::parse();
 
     let mut summary = StatusSummary::default();
 
-    for _ in 0..args.runs {
-        let output = std::process::Command::new(&head)
-            .args(&tail)
+    for _ in 0..runs {
+        let Output {
+            status,
+            stdout,
+            stderr,
+        } = std::process::Command::new(&cmd)
+            .args(&args)
             .output()
             .context("couldn't execute command")?;
-        match output.status.code() {
-            Some(0) => summary.successes += 1,
-            Some(code) => *summary.failures.entry(code).or_default() += 1,
-            None => summary.killed += 1,
+        match status.code() {
+            Some(0) => {
+                summary.successes += 1;
+                println!("{}\t{}", "ok".green(), summary)
+            }
+            Some(code) => {
+                *summary.failures.entry(code).or_default() += 1;
+                println!("{}\t{}", format!("failed: {code}").red(), summary);
+            }
+            None => {
+                summary.killed += 1;
+                println!("{}\t{}", "killed".red(), summary)
+            }
         }
-        info!(?output.status, ?summary);
-        debug!(?output);
+        match (show_output, status.success()) {
+            (ShowOutput::OnSuccess, true)
+            | (ShowOutput::OnFailure, false)
+            | (ShowOutput::Always, _) => {
+                if !stdout.is_empty() {
+                    println!("{}", "stdout:".bold());
+                    println!("{}", String::from_utf8_lossy(stdout.as_slice()).dimmed())
+                }
+                if !stderr.is_empty() {
+                    println!("{}", "stderr:".bold());
+                    println!("{}", String::from_utf8_lossy(stderr.as_slice()).dimmed())
+                }
+            }
+            _ => {}
+        }
     }
 
     println!("successes: {}", summary.successes);
@@ -71,4 +94,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+impl fmt::Display for StatusSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let successes = self.successes;
+        let failures = self.killed + self.failures.values().sum::<usize>();
+        f.write_fmt(format_args!(
+            "{}",
+            format!("({successes} successes, {failures} failures)").dimmed()
+        ))
+    }
 }
